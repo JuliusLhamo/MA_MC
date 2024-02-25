@@ -1,0 +1,341 @@
+---
+title: "use_case_credit"
+author: "Julius Landes"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(mcboost)
+library(mlr3)
+```
+
+```{r}
+set.seed(123)
+```
+
+
+```{r}
+library(data.table)
+adult_train = fread(
+  "https://raw.githubusercontent.com/Yorko/mlcourse.ai/master/data/adult_train.csv",
+  stringsAsFactors = TRUE
+)
+adult_train$Country = NULL
+adult_train$fnlwgt = NULL
+train_tsk = TaskClassif$new("adult_train", adult_train, target = "Target")
+```
+```{r}
+library(mlr3pipelines)
+pipe = po("collapsefactors", no_collapse_above_prevalence = 0.0006) %>>%
+  po("fixfactors") %>>%
+  po("encode") %>>%
+  po("imputehist")
+prep_task = pipe$train(train_tsk)[[1]]
+```
+
+
+```{r}
+prep_task$set_col_roles(c("Race.Amer.Indian.Eskimo", "Race.Asian.Pac.Islander", "Race.Black", "Race.Other", "Race.White"), remove_from = "feature")
+```
+
+```{r}
+library(mlr3learners)
+l = lrn("classif.ranger", num.trees = 10L, predict_type = "prob")
+l$train(prep_task)
+```
+
+
+```{r}
+init_predictor = function(data) {
+  l$predict_newdata(data)$prob[, 2]
+}
+```
+
+```{r}
+data = prep_task$data(cols = prep_task$feature_names)
+labels = 1 - one_hot(prep_task$data(cols = prep_task$target_names)[[1]])
+```
+
+```{r}
+mc = MCBoost$new(auditor_fitter = "RidgeAuditorFitter", init_predictor = init_predictor)
+mc$multicalibrate(data, labels)
+```
+
+```{r}
+ mc_calibration = MCBoost$new(
+    init_predictor = init_predictor,
+    auditor_fitter = "TreeAuditorFitter",
+    num_buckets = 10,
+    multiplicative = FALSE
+  )
+
+mc_calibration$multicalibrate(data, labels)
+```
+
+
+
+```{r}
+#Multiaccuracy
+mc
+
+#Multicalibration
+mc_calibration
+```
+
+```{r}
+adult_test = fread(
+  "https://raw.githubusercontent.com/Yorko/mlcourse.ai/master/data/adult_test.csv",
+  stringsAsFactors = TRUE
+)
+adult_test$Country = NULL
+adult_test$fnlwgt = NULL
+
+# The first row seems to have an error
+adult_test = adult_test[Target != "",]
+adult_test$Target = droplevels(adult_test$Target)
+
+# Note, that we have to convert columns from numeric to integer here:
+sdc = train_tsk$feature_types[type == "integer", id]
+adult_test[, (sdc) := lapply(.SD, as.integer), .SDcols = sdc]
+
+test_tsk = TaskClassif$new("adult_test", adult_test, target = "Target")
+prep_test = pipe$predict(test_tsk)[[1]]
+```
+```{r}
+test_data = prep_test$data(cols = prep_test$feature_names)
+test_labels = 1 - one_hot(prep_test$data(cols = prep_test$target_names)[[1]])
+```
+
+predict multiaccuracy
+```{r}
+prs = mc$predict_probs(test_data)
+```
+
+accuracy of multiaccurate predictor
+```{r}
+acc_ma<-mean(round(prs) == test_labels)
+```
+accuracy of f0
+```{r}
+acc_f0<-mean(round(init_predictor(test_data)) == test_labels)
+```
+
+```{r}
+prs_calibrated = mc_calibration$predict_probs(test_data)
+```
+
+```{r}
+acc_mc<- mean(round(prs_calibrated) == test_labels)
+```
+accuracy of f0
+```{r}
+mean(round(init_predictor(test_data)) == test_labels)
+```
+
+
+```{r}
+# Get bias per subgroup for multi-calibrated predictor
+adult_test$biasmc = (prs - test_labels)
+table_mc_adult<-adult_test[, .(abs(mean(biasmc)), .N), by = .(Race)]
+# Get bias per subgroup for initial predictor
+adult_test$biasinit = (init_predictor(test_data) - test_labels)
+table_rf_adult<-adult_test[, .(abs(mean(biasinit)), .N), by = .(Race)]
+```
+
+```{r}
+# Get bias per subgroup for multi-calibrated predictor
+adult_test$biasmcali = (prs_calibrated - test_labels)
+table_mcali_adult<-adult_test[, .(abs(mean(biasmcali)), .N), by = .(Race)]
+```
+
+
+```{r}
+ae = mc$auditor_effect(test_data)
+hist(ae)
+
+```
+
+```{r}
+effect = apply(test_data[ae >= median(ae[ae > 0]),], 2, quantile)
+no_effect  = apply(test_data[ae < median(ae[ae>0]),], 2, quantile)
+difference = apply((effect-no_effect), 2, mean)
+difference[difference > 0.1]
+```
+
+```{r}
+test_data[ae >= median(ae[ae>0]), names(which(difference > 0.1)), with = FALSE]
+```
+```{r}
+library(formattable)
+library(dplyr)
+```
+
+```{r}
+table_rf_adult <- table_rf_adult %>%
+  select(Race,V1,N)
+```
+
+data tangling table f0 inital predictor
+```{r}
+
+setnames(table_rf_adult, old = c("Race","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_rf_adult, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_rf_adult<- transpose(table_rf_adult)
+
+setnames(table_rf_adult, old= c("V1","V2","V3","V4","V5"),
+         new = c("Black", "White", "Asian Pac-Islander", "Other", "Amer-Indian-Eskimo"))
+
+table_rf_adult<-table_rf_adult[-1]
+```
+
+data tangling table mc beauty
+```{r}
+setnames(table_mc_adult, old = c("Race","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_mc_adult, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_mc_adult<- transpose(table_mc_adult)
+
+setnames(table_mc_adult, old= c("V1","V2","V3","V4","V5"),
+         new = c("Black", "White", "Asian Pac-Islander", "Other", "Amer-Indian-Eskimo"))
+
+table_mc_adult<-table_mc_adult[-1]
+
+table_adult<- rbind(table_rf_adult, table_mc_adult)
+
+table_adult <- table_adult[-2]
+```
+
+```{r}
+table_adult_round<-table_adult[1:2]
+table_adult_groups <- table_adult[3]
+table_adult_round<-table_adult_round[, lapply(.SD, function(x) round(as.numeric(x), 3))]
+```
+
+```{r}
+table_adult_final<-rbind(table_adult_groups, table_adult_round)
+table_mcali_adult_values <- table_mcali_adult$V1
+
+table_mcali_adult_values_r <-round(table_mcali_adult_values, digits = 3)
+
+table_mcali_adult_values_r2 <- t(table_mcali_adult_values_r)
+table_mcali_adult_values_r3 <- as.data.frame(table_mcali_adult_values_r2)
+
+setnames(table_mcali_adult_values_r3, old= c("V1","V2","V3","V4","V5"),
+         new = c("Black", "White", "Asian Pac-Islander", "Other", "Amer-Indian-Eskimo"))
+table_adult_final <- rbind(table_adult_final, table_mcali_adult_values_r3)
+
+table_adult_final$Overall_Accuracy <- c(NA,1-round(acc_f0, digits = 3), 1-round(acc_ma, digits = 3), 1-round(acc_mc, digits = 3))
+table_adult_final[is.na(table_adult_final)] <- ""
+new_row_names <- c("group size", "RF", "MA", "MC")
+rownames(table_adult_final) <- new_row_names
+col_names <- c("Black","White","Asian Pac-Islander", "Other", "Amer-Indian-Eskimo", "Overall Classification Error")
+colnames(table_adult_final) <- col_names
+```
+
+```{r}
+table_adult_final <- formattable(table_adult_final)
+```
+
+
+fairness tpr fairness npv fairness acc 
+```{r}
+# design = benchmark_grid(
+#   tasks = tsks("adult_train"),
+#   learners = lrns(c("classif.ranger", "classif.rpart"),
+#     predict_type = "prob", predict_sets = c("train", "test")),
+#   resamplings = rsmps("cv", folds = 3)
+# )
+# 
+# bmr = benchmark(design)
+# 
+# # Operations have been set to `groupwise_quotient()`
+# measures = list( msr("fairness.tpr"), msr("fairness.npv"), msr("fairness.acc"), msr("classif.acc") )
+# 
+# tab = bmr$aggregate(measures)
+# tab
+```
+
+```{r}
+# msr("fairness.acc", operation = groupdiff_diff)
+```
+
+```{r}
+# t = tsk("adult_train")$filter(1:1000)
+# mm = msr("fairness.acc", operation = function(x) {x["Female"]})
+# l = lrn("classif.rpart")
+# prds = l$train(t)$predict(t)
+# prds$score(mm, t)
+```
+
+
+
+```{r}
+# task = tsk("adult_train")$filter(1:500)
+# learner = lrn("classif.ranger", predict_type = "prob")
+# learner$train(task)
+# predictions = learner$predict(task)
+# design = benchmark_grid(
+#   tasks = task,
+#   learners = lrns(c("classif.ranger", "classif.rpart"),
+#     predict_type = "prob", predict_sets = c("train", "predict")),
+#   resamplings = rsmps("cv", folds = 3)
+# )
+# 
+# bmr = benchmark(design)
+# fairness_measure = msr("fairness.tpr")
+# fairness_measures = msrs(c("fairness.tpr", "fairness.fnr", "fairness.acc"))
+# 
+# # Predictions
+# compare_metrics(predictions, fairness_measure, task)
+# compare_metrics(predictions, fairness_measures, task)
+# 
+# # BenchmarkResult and ResamplingResult
+# compare_metrics(bmr, fairness_measure)
+# compare_metrics(bmr, fairness_measures)
+```
+
+
+```{r}
+# predictions<- l$predict(prep_task)
+# design = benchmark_grid(
+#   tasks = prep_task,
+#   learners = lrns(c("classif.ranger", "classif.rpart"),
+#     predict_type = "prob", predict_sets = c("train", "predict")),
+#   resamplings = rsmps("cv", folds = 3)
+# )
+# 
+# bmr = benchmark(design)
+```
+
+```{r}
+# fairness_measure = msr("fairness.tpr")
+# fairness_measures = msrs(c("fairness.tpr", "fairness.fnr", "fairness.acc"))
+```
+
+```{r}
+# compare_metrics(predictions, fairness_measure, prep_task)
+# compare_metrics(predictions, fairness_measures, prep_task)
+```
+
+```{r}
+# # BenchmarkResult and ResamplingResult
+# compare_metrics(bmr, fairness_measure)
+# compare_metrics(bmr, fairness_measures)
+```
+
+
+
+
+
+
+
+
+

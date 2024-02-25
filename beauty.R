@@ -1,0 +1,414 @@
+
+library(mcboost)
+#library(fairness)
+library(mlr3fairness)
+#library(fairml)
+#library(fairmodels)
+library(data.table)
+library(mlr3)
+library(mlr3pipelines)
+library(mlr3learners)
+
+set.seed(123)
+
+encode_variable <- function(value) {
+  ifelse(value >= 4, 1, 0)
+}
+
+
+
+beauty = fread(
+  "https://raw.githubusercontent.com/Yorko/mlcourse.ai/master/data/beauty.csv",
+  stringsAsFactors = TRUE
+)
+
+beauty$looks<-encode_variable(beauty$looks)
+
+beauty$looks <- as.factor(beauty$looks)
+
+beauty$black <- factor(beauty$black, levels = c(0,1), labels = c("non-black","black"))
+beauty$female <- factor(beauty$female, levels = c(0,1), labels = c("male","female"))
+beauty$union  <- as.factor(beauty$union)
+beauty$goodhlth <- as.factor(beauty$goodhlth)
+beauty$married <- as.factor(beauty$married )
+beauty$service <- as.factor(beauty$service)
+tsk_beauty = TaskClassif$new("beauty",beauty, target = "looks")
+
+# looks von 1-3 -> 0 und 4-5 -> 1 codieren 
+# 
+# Unbalanced groups 
+# ratio of male female is approx. 2:1 
+# ratio of blacks / non blacks approx. 1:12 
+
+#overview
+head(beauty)
+str(beauty)
+summary(beauty)
+
+#freqs of sensitive vars
+table(beauty$black)
+
+table(beauty$female)
+
+
+
+# splitting ratio 0.8
+#splitting of data into train and test data
+train_tsk_beauty_ind <- partition(tsk_beauty, ratio = 0.8)
+#train indices
+train_ind <- train_tsk_beauty_ind[[1]]
+#test indices
+test_ind <- train_tsk_beauty_ind[[2]]
+#train data
+train_data_beauty<- beauty[train_ind]
+#test data
+data_test_beauty <- beauty[test_ind]
+
+
+
+train_tsk_beauty = TaskClassif$new("train_data_beauty",train_data_beauty, target = "looks")
+
+
+# pipeline for preprocessing
+
+pipe_beauty = po("collapsefactors", no_collapse_above_prevalence = 0.0006) %>>%
+  po("fixfactors") %>>%
+  po("encode") %>>%
+  po("imputehist")
+prep_task_beauty = pipe_beauty$train(train_tsk_beauty)[[1]]
+
+
+#removing sensitive vars
+
+prep_task_beauty$set_col_roles(c("black.black","black.non.black","female.female",
+                                 "female.male"), remove_from = "feature")
+
+
+#fitting random forest
+
+l.beauty = lrn("classif.ranger", num.trees = 10L, predict_type = "prob")
+l.beauty$train(prep_task_beauty)
+
+# f0 init predictor
+
+init_predictor_beauty = function(data) {
+  l.beauty$predict_newdata(data)$prob[, 2]
+}
+
+#extracting data and labels
+
+data_beauty = prep_task_beauty$data(cols = prep_task_beauty$feature_names)
+labels_beauty = 1 - one_hot(prep_task_beauty$data(cols = prep_task_beauty$target_names)[[1]])
+
+#multiaccuracy
+
+mc_beauty = MCBoost$new(auditor_fitter = "RidgeAuditorFitter", init_predictor = init_predictor_beauty)
+mc_beauty$multicalibrate(data_beauty, labels_beauty)
+
+#multicalibration
+
+mcali_beauty = MCBoost$new(
+  init_predictor = init_predictor_beauty,
+  auditor_fitter = "TreeAuditorFitter",
+  num_buckets = 10,
+  multiplicative = FALSE
+)
+
+mcali_beauty$multicalibrate(data_beauty, labels_beauty)
+
+
+
+#Evaluation on test data
+
+test_tsk_beauty = TaskClassif$new("data_test_beauty", data_test_beauty, target = "looks")
+prep_test_beauty = pipe_beauty$predict(test_tsk_beauty)[[1]]
+
+test_data_beauty = prep_test_beauty$data(cols = prep_test_beauty$feature_names)
+test_labels_beauty = 1 - one_hot(prep_test_beauty$data(cols = prep_test_beauty$target_names)[[1]])
+
+
+prs_beauty = mc_beauty$predict_probs(test_data_beauty)
+
+acc_ma_beauty<-mean(round(prs_beauty) == test_labels_beauty)
+
+acc_rf_beauty<-mean(round(init_predictor_beauty(test_data_beauty)) == test_labels_beauty)
+
+
+
+prs_beauty_cali = mcali_beauty$predict_probs(test_data_beauty)
+
+
+
+acc_mc_beauty<-mean(round(prs_beauty_cali) == test_labels_beauty)
+
+# Get bias per subgroup for multi-calibrated predictor
+data_test_beauty$biasmc = (prs_beauty - test_labels_beauty)
+table_mc_beauty<- data_test_beauty[, .(abs(mean(biasmc)), .N), by = .(female,black)]
+# Get bias per subgroup for initial predictor
+data_test_beauty$biasinit = (init_predictor_beauty(test_data_beauty) - test_labels_beauty)
+table_f0_beauty<-data_test_beauty[, .(abs(mean(biasinit)), .N), by = .(female,black)]
+
+# Get bias per subgroup for multi-calibrated predictor
+data_test_beauty$biasmcali = (prs_beauty_cali - test_labels_beauty)
+table_mcali_beauty<-data_test_beauty[, .(abs(mean(biasmcali)), .N), by = .(female,black)]
+
+ae_beauty = mc_beauty$auditor_effect(test_data_beauty)
+hist(ae_beauty)
+
+#3rd iteration used
+prs_beauty_3 = mc_beauty$predict_probs(test_data_beauty, t = 3L)
+
+mean(round(prs_beauty_3) == test_labels_beauty)
+
+#2nd iteration used
+
+prs_beauty_2 = mc_beauty$predict_probs(test_data_beauty, t = 2L)
+
+
+
+mean(round(prs_beauty_2) == test_labels_beauty)
+
+prs_beauty_mcali = mcali_beauty$predict_probs(test_data_beauty)
+
+mean(round(prs_beauty_mcali) == test_labels_beauty)
+
+library(formattable)
+library(dplyr)
+
+table_f0_beauty <- table_f0_beauty %>%
+  select(black,female,V1,N)
+
+#data tangling table f0 inital predictor
+
+table_f0_beauty[, new_col := paste(black, female)]
+
+table_f0_beauty[, c("black","female") := NULL]
+
+setnames(table_f0_beauty, old = c("new_col","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_f0_beauty, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_f0_beauty<- transpose(table_f0_beauty)
+
+setnames(table_f0_beauty, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+
+table_f0_beauty<-table_f0_beauty[-1]
+
+#data tangling table mc beauty
+
+table_mc_beauty[, new_col := paste(black, female)]
+
+table_mc_beauty[, c("black","female") := NULL]
+
+setnames(table_mc_beauty, old = c("new_col","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_mc_beauty, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_mc_beauty<- transpose(table_mc_beauty)
+
+setnames(table_mc_beauty, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+
+table_mc_beauty<-table_mc_beauty[-1]
+
+table_beauty <- rbind(table_f0_beauty, table_mc_beauty)
+
+table_beauty <- table_beauty[-2]
+
+table_beauty_round<-table_beauty[1:2]
+table_beauty_groups <- table_beauty[3]
+table_beauty_round<-table_beauty_round[, lapply(.SD, function(x) round(as.numeric(x), 3))]
+
+table_beauty<-rbind(table_beauty_groups, table_beauty_round)
+
+#multicalibraiton add 
+table_mcali_beauty_values <- table_mcali_beauty$V1
+
+table_mcali_beauty_values_r <-round(table_mcali_beauty_values, digits = 3)
+
+table_mcali_beauty_values_r2 <- t(table_mcali_beauty_values_r)
+table_mcali_beauty_values_r3 <- as.data.frame(table_mcali_beauty_values_r2)
+
+setnames(table_mcali_beauty_values_r3, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+table_beauty_final <- rbind(table_beauty, table_mcali_beauty_values_r3)
+table_beauty_final$Overall_Accuracy <- c(NA,1-round(acc_f0_beauty, digits = 3), 1-round(acc_beauty_ma, digits = 3), 1-round(acc_beauty_mc, digits = 3))
+table_beauty_final[is.na(table_beauty_final)] <- ""
+
+new_row_names <- c("group size", "RF", "MA","MC")
+rownames(table_beauty_final) <- new_row_names
+
+col_names <- c("non-black female", "non-black male", "black male", "black female", "Overall Classification Error")
+colnames(table_beauty_final) <- col_names
+
+beauty_table_05 <- formattable(table_beauty_final)
+
+# now save beauty_table_05 with Export and 800 x 200 
+
+#### WAS JUST FOR TESTING
+
+# splitting ratio 0.5
+
+#splitting of data into train and test data
+train_tsk_beauty_ind <- partition(tsk_beauty, ratio = 0.5)
+#train indices
+train_ind <- train_tsk_beauty_ind[[1]]
+#test indices
+test_ind <- train_tsk_beauty_ind[[2]]
+#train data
+train_data_beauty<- beauty[train_ind]
+#test data
+data_test_beauty <- beauty[test_ind]
+
+
+
+train_tsk_beauty = TaskClassif$new("train_data_beauty",train_data_beauty, target = "looks")
+
+
+#pipeline for preprocessing
+
+pipe_beauty = po("collapsefactors", no_collapse_above_prevalence = 0.0006) %>>%
+  po("fixfactors") %>>%
+  po("encode") %>>%
+  po("imputehist")
+prep_task_beauty = pipe_beauty$train(train_tsk_beauty)[[1]]
+
+
+#removing sensitive vars
+
+prep_task_beauty$set_col_roles(c("black.black","black.non.black","female.female",
+                                 "female.male"), remove_from = "feature")
+
+
+#fitting random forest
+
+l.beauty = lrn("classif.ranger", num.trees = 10L, predict_type = "prob")
+l.beauty$train(prep_task_beauty)
+
+#f0 init predictor
+
+init_predictor_beauty = function(data) {
+  l.beauty$predict_newdata(data)$prob[, 2]
+}
+
+#extracting data and labels
+
+data_beauty = prep_task_beauty$data(cols = prep_task_beauty$feature_names)
+labels_beauty = 1 - one_hot(prep_task_beauty$data(cols = prep_task_beauty$target_names)[[1]])
+
+#multiaccuracy
+
+mc_beauty = MCBoost$new(auditor_fitter = "RidgeAuditorFitter", init_predictor = init_predictor_beauty)
+mc_beauty$multicalibrate(data_beauty, labels_beauty)
+
+#multicalibration
+
+mcali_beauty = MCBoost$new(
+  init_predictor = init_predictor_beauty,
+  auditor_fitter = "TreeAuditorFitter",
+  num_buckets = 10,
+  multiplicative = FALSE
+)
+mcali_beauty$multicalibrate(data_beauty, labels_beauty)
+
+
+#Evaluation on test data
+
+
+test_tsk_beauty = TaskClassif$new("data_test_beauty", data_test_beauty, target = "looks")
+prep_test_beauty = pipe_beauty$predict(test_tsk_beauty)[[1]]
+
+test_data_beauty = prep_test_beauty$data(cols = prep_test_beauty$feature_names)
+test_labels_beauty = 1 - one_hot(prep_test_beauty$data(cols = prep_test_beauty$target_names)[[1]])
+
+prs_beauty = mc_beauty$predict_probs(test_data_beauty)
+
+acc_beauty_ma<-mean(round(prs_beauty) == test_labels_beauty)
+
+prs_beauty_cali = mcali_beauty$predict_probs(test_data_beauty)
+
+acc_beauty_mc<- mean(round(prs_beauty_cali) == test_labels_beauty)
+
+#accuracy of f0
+
+acc_f0_beauty<-mean(round(init_predictor_beauty(test_data_beauty)) == test_labels_beauty)
+
+# Get bias per subgroup for multi-calibrated predictor
+data_test_beauty$biasmc = (prs_beauty - test_labels_beauty)
+table_mc_beauty<- data_test_beauty[, .(abs(mean(biasmc)), .N), by = .(female,black)]
+# Get bias per subgroup for initial predictor
+data_test_beauty$biasinit = (init_predictor_beauty(test_data_beauty) - test_labels_beauty)
+table_f0_beauty<-data_test_beauty[, .(abs(mean(biasinit)), .N), by = .(female,black)]
+
+ae_beauty = mc_beauty$auditor_effect(test_data_beauty)
+hist_08<-hist(ae_beauty)
+
+table_f0_beauty <- table_f0_beauty %>%
+  select(black,female,V1,N)
+
+
+#data tangling table f0 inital predictor
+
+table_f0_beauty[, new_col := paste(black, female)]
+
+table_f0_beauty[, c("black","female") := NULL]
+
+setnames(table_f0_beauty, old = c("new_col","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_f0_beauty, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_f0_beauty<- transpose(table_f0_beauty)
+
+setnames(table_f0_beauty, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+
+table_f0_beauty<-table_f0_beauty[-1]
+
+#data tangling table mc beauty
+
+table_mc_beauty[, new_col := paste(black, female)]
+
+table_mc_beauty[, c("black","female") := NULL]
+
+setnames(table_mc_beauty, old = c("new_col","V1"), new = c("subgroups", "classifaction_error"))
+
+setcolorder(table_mc_beauty, neworder = c("subgroups", "classifaction_error", "N"))
+
+table_mc_beauty<- transpose(table_mc_beauty)
+
+setnames(table_mc_beauty, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+
+table_mc_beauty<-table_mc_beauty[-1]
+
+table_beauty <- rbind(table_f0_beauty, table_mc_beauty)
+
+table_beauty <- table_beauty[-2]
+
+table_beauty_round<-table_beauty[1:2]
+table_beauty_groups <- table_beauty[3]
+table_beauty_round<-table_beauty_round[, lapply(.SD, function(x) round(as.numeric(x), 3))]
+
+table_beauty<-rbind(table_beauty_groups, table_beauty_round)
+
+table_mcali_beauty_values <- table_mcali_beauty$V1
+
+table_mcali_beauty_values_r <-round(table_mcali_beauty_values, digits = 3)
+
+table_mcali_beauty_values_r2 <- t(table_mcali_beauty_values_r)
+table_mcali_beauty_values_r3 <- as.data.frame(table_mcali_beauty_values_r2)
+
+setnames(table_mcali_beauty_values_r3, old= c("V1","V2","V3","V4"),
+         new = c("non-black female", "non-black male", "black male", "black female"))
+table_beauty_final <- rbind(table_beauty, table_mcali_beauty_values_r3)
+table_beauty_final$Overall_Accuracy <- c(NA,1-round(acc_f0_beauty, digits = 3), 1-round(acc_beauty_ma, digits = 3), 1-round(acc_beauty_mc, digits = 3))
+table_beauty_final[is.na(table_beauty_final)] <- ""
+
+new_row_names <- c("group size", "RF", "MA","MC")
+rownames(table_beauty_final) <- new_row_names
+
+col_names <- c("non-black female", "non-black male", "black male", "black female", "Overall Classification Error")
+colnames(table_beauty_final) <- col_names
+
+beauty_table_05 <- formattable(table_beauty_final)
