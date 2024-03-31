@@ -1,4 +1,5 @@
 **Multiaccuracy/Multicalibration**
+
 This project is a use case of two different datasets - the Beauty Dataset and the Adult Dataset - to explore the fairness notions of multi-calibration and multi-accuracy in machine learning.
 
 The Beauty Dataset contains information about beauty products, including ratings and reviews, while the Adult Dataset contains census data on individuals, including their income levels. The project aims to evaluate the fairness of machine learning models trained on these datasets, with a focus on multi-calibration and multi-accuracy.
